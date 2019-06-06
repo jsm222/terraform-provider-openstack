@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/gophercloud/gophercloud"
-	"github.com/gophercloud/gophercloud/openstack/blockstorage/v3/volumes"
+	"github.com/gophercloud/gophercloud/openstack/blockstorage/v2/volumes"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/availabilityzones"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/bootfromvolume"
 	"github.com/gophercloud/gophercloud/openstack/compute/v2/extensions/keypairs"
@@ -27,19 +27,6 @@ import (
 	"github.com/hashicorp/terraform/helper/validation"
 )
 
-func resourceOpenStackComputeInstanceV2ImportState(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
-	results := make([]*schema.ResourceData, 1)
-	err := resourceComputeInstanceV2Read(d, meta)
-
-	if err != nil {
-		return nil, err
-	}
-
-	results[0] = d
-
-	return results, nil
-
-}
 func resourceComputeInstanceV2() *schema.Resource {
 	return &schema.Resource{
 		Create: resourceComputeInstanceV2Create,
@@ -648,50 +635,6 @@ func resourceComputeInstanceV2Read(d *schema.ResourceData, meta interface{}) err
 	if err != nil {
 		return CheckDeleted(d, err, "server")
 	}
-	computeClient.Microversion = "2.3" // Required for returning delete_on_termination
-	raw := servers.Get(computeClient, d.Id())
-	server, err1 := raw.Extract()
-	if err1 != nil {
-		return CheckDeleted(d, err1, "server")
-	}
-	var serverWithAttachments struct {
-		VolumesAttached []map[string]interface{} `json:"os-extended-volumes:volumes_attached"`
-	}
-	raw.ExtractInto(&serverWithAttachments)
-
-	log.Printf("[DEBUG] Retrieved ServerAttachments %+v", serverWithAttachments)
-
-	bds := []map[string]interface{}{}
-	if len(serverWithAttachments.VolumesAttached) > 0 {
-		blockStorageClient, err := config.blockStorageV2Client(GetRegion(d, config))
-		if err != nil {
-			return fmt.Errorf("Error creating OpenStack volume client: %s", err)
-		}
-		idx := 0
-		for _, b := range serverWithAttachments.VolumesAttached {
-
-			vol, err := volumes.Get(blockStorageClient, b["id"].(string)).Extract()
-			if err != nil {
-				log.Printf("[ERR] %s", err)
-			}
-			v := map[string]interface{}{
-				"delete_on_termination": b["delete_on_termination"],
-				"uuid":                  vol.VolumeImageMetadata["image_id"],
-				"boot_index":            idx,
-				"destination_type":      "volume",
-				"source_type":           "image",
-				"volume_size":           vol.Size,
-				"disk_bus":              "",
-				"device_type":           "",
-			}
-			if vol.Bootable == "true" {
-				bds = append(bds, v)
-				idx++
-			}
-		}
-		d.Set("block_device", bds)
-	}
-
 	// Set the availability zone
 	d.Set("availability_zone", serverWithAZ.AvailabilityZone)
 
@@ -1006,6 +949,77 @@ func resourceComputeInstanceV2Delete(d *schema.ResourceData, meta interface{}) e
 	return nil
 }
 
+func resourceOpenStackComputeInstanceV2ImportState(d *schema.ResourceData, meta interface{}) ([]*schema.ResourceData, error) {
+	var serverWithAttachments struct {
+		VolumesAttached []map[string]interface{} `json:"os-extended-volumes:volumes_attached"`
+	}
+	type volumeWithVolMeta struct {
+	}
+	config := meta.(*Config)
+	computeClient, err := config.computeV2Client(GetRegion(d, config))
+	if err != nil {
+		return nil, fmt.Errorf("Error creating OpenStack compute client: %s", err)
+	}
+
+	results := make([]*schema.ResourceData, 1)
+	err = resourceComputeInstanceV2Read(d, meta)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading openstack_compute_instance_v2 %s: %s", d.Id(), err)
+	}
+
+	computeClient.Microversion = "2.3"
+	raw := servers.Get(computeClient, d.Id())
+	if raw.Err != nil {
+		return nil, CheckDeleted(d, raw.Err, "openstack_compute_instance_v2")
+	}
+
+	raw.ExtractInto(&serverWithAttachments)
+
+	log.Printf("[DEBUG] Retrieved openstack_compute_instance_v2 %s volume attachments: %#v",
+		d.Id(), serverWithAttachments)
+
+	bds := []map[string]interface{}{}
+	if len(serverWithAttachments.VolumesAttached) > 0 {
+		blockStorageClient, err := config.blockStorageV2Client(GetRegion(d, config))
+		if err != nil {
+			return nil, fmt.Errorf("Error creating OpenStack volume client: %s", err)
+		}
+
+		var volMetaData = struct {
+			VolumeImageMetadata map[string]interface{} `json:"volume_image_metadata"`
+			Id                  string                 `json:"id"`
+			Size                int                    `json:"size"`
+			Bootable            string                 `json:"bootable"`
+		}{}
+		for i, b := range serverWithAttachments.VolumesAttached {
+			rawVolume := volumes.Get(blockStorageClient, b["id"].(string))
+			rawVolume.ExtractInto(&volMetaData)
+
+			log.Printf("[DEBUG] retrieved volume%+v", volMetaData)
+			v := map[string]interface{}{
+				"delete_on_termination": false,
+				"uuid":                  volMetaData.VolumeImageMetadata["image_id"],
+				"boot_index":            i,
+				"destination_type":      "volume",
+				"source_type":           "image",
+				"volume_size":           volMetaData.Size,
+				"disk_bus":              "",
+				"device_type":           "",
+			}
+
+			if volMetaData.Bootable == "true" {
+				bds = append(bds, v)
+			}
+		}
+
+		d.Set("block_device", bds)
+	}
+
+	results[0] = d
+
+	return results, nil
+}
+
 // ServerV2StateRefreshFunc returns a resource.StateRefreshFunc that is used to watch
 // an OpenStack instance.
 func ServerV2StateRefreshFunc(client *gophercloud.ServiceClient, instanceID string) resource.StateRefreshFunc {
@@ -1177,6 +1191,7 @@ func setImageInformation(computeClient *gophercloud.ServiceClient, server *serve
 			return nil
 		}
 	}
+
 	if server.Image["id"] != nil {
 		imageId := server.Image["id"].(string)
 		if imageId != "" {
